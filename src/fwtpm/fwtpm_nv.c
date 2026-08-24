@@ -2331,9 +2331,11 @@ int FWTPM_NV_Init(FWTPM_CTX* ctx)
         /* No valid NV image — generate fresh hierarchy seeds */
         if (rc == TPM_RC_SUCCESS && hdr.magic == FWTPM_NV_MAGIC &&
             hdr.version != FWTPM_NV_VERSION) {
+        #ifdef DEBUG_WOLFTPM
             fprintf(stderr, "WARNING: fwTPM NV version mismatch "
                 "(found %d, expected %d) — regenerating seeds\n",
                 (int)hdr.version, (int)FWTPM_NV_VERSION);
+        #endif
         }
         rc = FwNvGenFreshState(ctx);
     }
