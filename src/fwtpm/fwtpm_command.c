@@ -779,8 +779,7 @@ static TPM_RC FwCmd_Startup(FWTPM_CTX* ctx, TPM2_Packet* cmd, int cmdSize,
 #endif
 
             /* Null seed: re-randomize on every Startup(CLEAR) per spec */
-            rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->nullSeed,
-                FWTPM_SEED_SIZE);
+            rc = FwRegenHierarchySeed(ctx, TPM_RH_NULL);
             if (rc != 0) rc = TPM_RC_FAILURE;
 
             /* TPM Reset: bump persisted resetCount, clear restartCount */
@@ -2765,7 +2764,7 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     UINT32 creationPcrCount = 0;
     FWTPM_Object* obj = NULL;
     TPM_HANDLE objHandle = 0;
-    byte* seed;
+    byte* seed = NULL;
     int paramSzPos = 0, paramStart = 0;
     byte templateHash[WC_SHA256_DIGEST_SIZE];
     FWTPM_PrimaryCache* cached = NULL;
@@ -2786,7 +2785,9 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     /* Parse primary handle (hierarchy) */
     if (rc == 0) {
         TPM2_Packet_ParseU32(cmd, &primaryHandle);
-        seed = FwGetHierarchySeed(ctx, primaryHandle);
+        /* Held for the whole derivation below, and released at the single
+         * exit point. */
+        seed = FwAcquireHierarchySeed(ctx, primaryHandle);
         if (seed == NULL) {
             rc = TPM_RC_HIERARCHY;
         }
@@ -3226,6 +3227,10 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     /* Cleanup on error */
     if (rc != 0 && obj != NULL) {
         FwFreeObject(obj);
+    }
+
+    if (seed != NULL) {
+        FwReleaseHierarchySeed(ctx, primaryHandle);
     }
 
     TPM2_ForceZero(&userAuth, sizeof(userAuth));
@@ -3687,10 +3692,9 @@ static TPM_RC FwCmd_Clear(FWTPM_CTX* ctx, TPM2_Packet* cmd, int cmdSize,
         XMEMSET(&ctx->endorsementAuth, 0, sizeof(ctx->endorsementAuth));
 
         /* Generate new owner and endorsement seeds */
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->ownerSeed, FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_OWNER);
         if (rc == 0)
-            rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->endorsementSeed,
-                FWTPM_SEED_SIZE);
+            rc = FwRegenHierarchySeed(ctx, TPM_RH_ENDORSEMENT);
         if (rc != 0) rc = TPM_RC_FAILURE;
 
         /* Only commit state changes if seed generation succeeded —
@@ -3785,8 +3789,7 @@ static TPM_RC FwCmd_ChangeEPS(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     #endif
 
         /* Generate new endorsement seed */
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->endorsementSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_ENDORSEMENT);
         if (rc != 0) rc = TPM_RC_FAILURE;
 
         /* Only commit state changes if seed generation succeeded */
@@ -3847,8 +3850,7 @@ static TPM_RC FwCmd_ChangePPS(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     #endif
 
         /* Generate new platform seed */
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->platformSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_PLATFORM);
         if (rc != 0) rc = TPM_RC_FAILURE;
 
         /* Only commit state changes if seed generation succeeded */

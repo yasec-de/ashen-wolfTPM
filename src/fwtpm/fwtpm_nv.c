@@ -41,6 +41,7 @@
 
 #include <wolftpm/fwtpm/fwtpm.h>
 #include <wolftpm/fwtpm/fwtpm_nv.h>
+#include <wolftpm/fwtpm/fwtpm_crypto.h>
 
 #include <wolfssl/wolfcrypt/hmac.h>
 
@@ -1152,6 +1153,34 @@ static int FwNvFindOrAllocCacheSlot(FWTPM_CTX* ctx, UINT32 hierarchy,
     return freeSlot;
 }
 
+/* Copy a seed out of a journal entry into its (possibly masked) storage */
+static void FwNvLoadSeed(FWTPM_CTX* ctx, UINT32 hierarchy,
+    const byte* value, UINT16 valueLen)
+{
+    byte* seed;
+    if (valueLen < FWTPM_SEED_SIZE) {
+        return;
+    }
+    seed = FwAcquireHierarchySeed(ctx, hierarchy);
+    if (seed != NULL) {
+        XMEMCPY(seed, value, FWTPM_SEED_SIZE);
+        FwReleaseHierarchySeed(ctx, hierarchy);
+    }
+}
+
+/* Append a seed to the journal, reading it from its (possibly masked) storage */
+static int FwNvAppendSeed(FWTPM_CTX* ctx, UINT16 tag, UINT32 hierarchy)
+{
+    byte* seed = FwAcquireHierarchySeed(ctx, hierarchy);
+    int rc;
+    if (seed == NULL) {
+        return TPM_RC_FAILURE;
+    }
+    rc = FwNvAppendEntry(ctx, tag, seed, FWTPM_SEED_SIZE);
+    FwReleaseHierarchySeed(ctx, hierarchy);
+    return rc;
+}
+
 /* Process a single TLV entry during journal scan */
 static int FwNvProcessEntry(FWTPM_CTX* ctx, UINT16 tag,
     const byte* value, UINT16 valueLen)
@@ -1161,21 +1190,15 @@ static int FwNvProcessEntry(FWTPM_CTX* ctx, UINT16 tag,
 
     switch (tag) {
         case FWTPM_NV_TAG_OWNER_SEED:
-            if (valueLen >= FWTPM_SEED_SIZE) {
-                XMEMCPY(ctx->ownerSeed, value, FWTPM_SEED_SIZE);
-            }
+            FwNvLoadSeed(ctx, TPM_RH_OWNER, value, valueLen);
             break;
 
         case FWTPM_NV_TAG_ENDORSEMENT_SEED:
-            if (valueLen >= FWTPM_SEED_SIZE) {
-                XMEMCPY(ctx->endorsementSeed, value, FWTPM_SEED_SIZE);
-            }
+            FwNvLoadSeed(ctx, TPM_RH_ENDORSEMENT, value, valueLen);
             break;
 
         case FWTPM_NV_TAG_PLATFORM_SEED:
-            if (valueLen >= FWTPM_SEED_SIZE) {
-                XMEMCPY(ctx->platformSeed, value, FWTPM_SEED_SIZE);
-            }
+            FwNvLoadSeed(ctx, TPM_RH_PLATFORM, value, valueLen);
             break;
 
         case FWTPM_NV_TAG_OWNER_AUTH:
@@ -1438,17 +1461,15 @@ static int FwNvGenFreshState(FWTPM_CTX* ctx)
     printf("fwTPM: No NV state found, generating fresh seeds\n");
 #endif
 
-    rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->ownerSeed, FWTPM_SEED_SIZE);
+    rc = FwRegenHierarchySeed(ctx, TPM_RH_OWNER);
     if (rc == 0) {
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->endorsementSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_ENDORSEMENT);
     }
     if (rc == 0) {
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->platformSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_PLATFORM);
     }
     if (rc == 0) {
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->nullSeed, FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_NULL);
     }
     if (rc != 0) {
         return TPM_RC_FAILURE;
@@ -1898,16 +1919,14 @@ int FWTPM_NV_Save(FWTPM_CTX* ctx)
 
     /* --- Seeds --- */
     if (rc == 0) {
-        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_OWNER_SEED,
-            ctx->ownerSeed, FWTPM_SEED_SIZE);
+        rc = FwNvAppendSeed(ctx, FWTPM_NV_TAG_OWNER_SEED, TPM_RH_OWNER);
     }
     if (rc == 0) {
-        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_ENDORSEMENT_SEED,
-            ctx->endorsementSeed, FWTPM_SEED_SIZE);
+        rc = FwNvAppendSeed(ctx, FWTPM_NV_TAG_ENDORSEMENT_SEED,
+            TPM_RH_ENDORSEMENT);
     }
     if (rc == 0) {
-        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PLATFORM_SEED,
-            ctx->platformSeed, FWTPM_SEED_SIZE);
+        rc = FwNvAppendSeed(ctx, FWTPM_NV_TAG_PLATFORM_SEED, TPM_RH_PLATFORM);
     }
     /* Note: null seed is NOT persisted (re-randomized on Startup) */
 
@@ -2177,15 +2196,13 @@ int FWTPM_NV_SaveSeeds(FWTPM_CTX* ctx)
     if (ctx == NULL) {
         return BAD_FUNC_ARG;
     }
-    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_OWNER_SEED,
-        ctx->ownerSeed, FWTPM_SEED_SIZE);
+    rc = FwNvAppendSeed(ctx, FWTPM_NV_TAG_OWNER_SEED, TPM_RH_OWNER);
     if (rc == 0) {
-        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_ENDORSEMENT_SEED,
-            ctx->endorsementSeed, FWTPM_SEED_SIZE);
+        rc = FwNvAppendSeed(ctx, FWTPM_NV_TAG_ENDORSEMENT_SEED,
+            TPM_RH_ENDORSEMENT);
     }
     if (rc == 0) {
-        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PLATFORM_SEED,
-            ctx->platformSeed, FWTPM_SEED_SIZE);
+        rc = FwNvAppendSeed(ctx, FWTPM_NV_TAG_PLATFORM_SEED, TPM_RH_PLATFORM);
     }
     return rc;
 }
