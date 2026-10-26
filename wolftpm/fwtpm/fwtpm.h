@@ -188,6 +188,32 @@
 #define FWTPM_DA_MAX_TRIES_LIMIT            0xFFFF
 #endif
 
+/* Context protection key size (AES-256) */
+#define FWTPM_CTX_PROTECT_KEY_SIZE  AES_256_KEY_SIZE
+
+/* Masked secret storage (optional integrator hook).
+ *
+ * With WOLFTPM_FWTPM_MASKED_SECRETS defined, the hierarchy seeds and the
+ * context protection key are not kept in FWTPM_CTX. The integrator supplies
+ * storage that is free to relocate or re-encode the bytes between uses, for
+ * example an SRAM data-remanence countermeasure. FWTPM_MaskedAcquire pins one
+ * secret and returns a writable pointer to it; FWTPM_MaskedRelease lets the
+ * integrator move it again. At most one acquire may be outstanding per handle,
+ * a failed acquire returns NULL, and the pointer is valid only until the
+ * matching release.
+ *
+ * The storage is process-global, so this supports a single FWTPM_CTX. */
+#ifdef WOLFTPM_FWTPM_MASKED_SECRETS
+#define FWTPM_MASKED_OWNER_SEED         0
+#define FWTPM_MASKED_ENDORSEMENT_SEED   1
+#define FWTPM_MASKED_PLATFORM_SEED      2
+#define FWTPM_MASKED_NULL_SEED          3
+#define FWTPM_MASKED_CTX_PROTECT_KEY    4
+
+WOLFTPM_API byte* FWTPM_MaskedAcquire(word32 handle);
+WOLFTPM_API void  FWTPM_MaskedRelease(word32 handle);
+#endif
+
 /* Maximum transient objects loaded at once (TPM 2.0 spec minimum: 3) */
 #ifndef FWTPM_MAX_OBJECTS
 #define FWTPM_MAX_OBJECTS      3
@@ -878,12 +904,14 @@ typedef struct FWTPM_CTX {
     FWTPM_Session sessions[FWTPM_MAX_SESSIONS];
 
     /* Hierarchy seeds (generated once, persisted in NV) */
+#ifndef WOLFTPM_FWTPM_MASKED_SECRETS
     byte ownerSeed[TPM_SHA384_DIGEST_SIZE];
     byte endorsementSeed[TPM_SHA384_DIGEST_SIZE];
-    /* 0: legacy endorsement proof/wrap; 1: proof bound to storage seed. */
-    UINT8 endorsementProofVersion;
     byte platformSeed[TPM_SHA384_DIGEST_SIZE];
     byte nullSeed[TPM_SHA384_DIGEST_SIZE];
+#endif
+    /* 0: legacy endorsement proof/wrap; 1: proof bound to storage seed. */
+    UINT8 endorsementProofVersion;
 
     /* Hierarchy auth values */
     TPM2B_AUTH ownerAuth;
@@ -905,7 +933,9 @@ typedef struct FWTPM_CTX {
     /* Per-boot context protection key (volatile only, never persisted).
      * Used by ContextSave/ContextLoad for HMAC + AES-CFB protection of
      * session context blobs per TPM 2.0 Part 1 Sec.30. */
-    byte ctxProtectKey[AES_256_KEY_SIZE];
+#ifndef WOLFTPM_FWTPM_MASKED_SECRETS
+    byte ctxProtectKey[FWTPM_CTX_PROTECT_KEY_SIZE];
+#endif
     int  ctxProtectKeyValid;
 #endif
 

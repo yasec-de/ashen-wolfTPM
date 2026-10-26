@@ -34,6 +34,7 @@
 #include <wolftpm/fwtpm/fwtpm.h>
 #include <wolftpm/fwtpm/fwtpm_command.h>
 #include <wolftpm/fwtpm/fwtpm_nv.h>
+#include <wolftpm/fwtpm/fwtpm_crypto.h>
 #include <string.h>
 
 int FWTPM_Init(FWTPM_CTX* ctx)
@@ -123,10 +124,17 @@ int FWTPM_Init(FWTPM_CTX* ctx)
     /* Generate per-boot context protection key (volatile only) for
      * ContextSave/ContextLoad HMAC + AES-CFB session blob protection. */
     if (rc == 0) {
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->ctxProtectKey,
-            sizeof(ctx->ctxProtectKey));
-        if (rc == 0) {
-            ctx->ctxProtectKeyValid = 1;
+        byte* protectKey = FwAcquireCtxProtectKey(ctx);
+        if (protectKey == NULL) {
+            rc = TPM_RC_FAILURE;
+        }
+        else {
+            rc = wc_RNG_GenerateBlock(&ctx->rng, protectKey,
+                FWTPM_CTX_PROTECT_KEY_SIZE);
+            FwReleaseCtxProtectKey(ctx);
+            if (rc == 0) {
+                ctx->ctxProtectKeyValid = 1;
+            }
         }
     }
 #endif
@@ -139,16 +147,13 @@ int FWTPM_Init(FWTPM_CTX* ctx)
 #else
     /* No NV: generate ephemeral seeds (lost on reset) */
     if (rc == 0)
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->ownerSeed, FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_OWNER);
     if (rc == 0)
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->endorsementSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_ENDORSEMENT);
     if (rc == 0)
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->platformSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_PLATFORM);
     if (rc == 0)
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->nullSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_NULL);
     if (rc == 0) {
         ctx->pcrAllocatedBanks = FWTPM_PCR_ALLOC_DEFAULT;
         ctx->endorsementProofVersion = 1;

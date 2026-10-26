@@ -240,10 +240,40 @@ int FwComputeObjectName(FWTPM_Object* obj)
     return FwComputePublicName(&obj->pub, &obj->name);
 }
 
-/** \brief Get hierarchy seed pointer for a given hierarchy handle.
- *  \return Pointer to seed bytes, or NULL for unknown hierarchy. */
-byte* FwGetHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy)
+#ifdef WOLFTPM_FWTPM_MASKED_SECRETS
+/* Map a hierarchy handle onto its masked storage handle, or -1 if unknown. */
+static int FwMaskedSeedHandle(UINT32 hierarchy)
 {
+    switch (hierarchy) {
+        case TPM_RH_OWNER:       return FWTPM_MASKED_OWNER_SEED;
+        case TPM_RH_ENDORSEMENT: return FWTPM_MASKED_ENDORSEMENT_SEED;
+        case TPM_RH_PLATFORM:    return FWTPM_MASKED_PLATFORM_SEED;
+        case TPM_RH_NULL:        return FWTPM_MASKED_NULL_SEED;
+        default:                 return -1;
+    }
+}
+#endif
+
+/** \brief Whether a hierarchy handle has a seed (owner, endorsement,
+ *  platform, null), without touching the seed itself. */
+int FwHierarchyHasSeed(UINT32 hierarchy)
+{
+    return hierarchy == TPM_RH_OWNER || hierarchy == TPM_RH_ENDORSEMENT ||
+        hierarchy == TPM_RH_PLATFORM || hierarchy == TPM_RH_NULL;
+}
+
+/** \brief Pin a hierarchy seed and return a writable pointer to it.
+ *  \return Pointer to seed bytes, or NULL for unknown hierarchy. */
+byte* FwAcquireHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy)
+{
+#ifdef WOLFTPM_FWTPM_MASKED_SECRETS
+    int handle = FwMaskedSeedHandle(hierarchy);
+    (void)ctx;
+    if (handle < 0) {
+        return NULL;
+    }
+    return FWTPM_MaskedAcquire((word32)handle);
+#else
     switch (hierarchy) {
         case TPM_RH_OWNER:
             return ctx->ownerSeed;
@@ -256,6 +286,66 @@ byte* FwGetHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy)
         default:
             return NULL;
     }
+#endif
+}
+
+void FwReleaseHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy)
+{
+#ifdef WOLFTPM_FWTPM_MASKED_SECRETS
+    int handle = FwMaskedSeedHandle(hierarchy);
+    (void)ctx;
+    if (handle >= 0) {
+        FWTPM_MaskedRelease((word32)handle);
+    }
+#else
+    (void)ctx;
+    (void)hierarchy;
+#endif
+}
+
+byte* FwAcquireCtxProtectKey(FWTPM_CTX* ctx)
+{
+#ifdef WOLFTPM_FWTPM_MASKED_SECRETS
+    (void)ctx;
+    return FWTPM_MaskedAcquire(FWTPM_MASKED_CTX_PROTECT_KEY);
+#else
+    return ctx->ctxProtectKey;
+#endif
+}
+
+void FwReleaseCtxProtectKey(FWTPM_CTX* ctx)
+{
+#ifdef WOLFTPM_FWTPM_MASKED_SECRETS
+    (void)ctx;
+    FWTPM_MaskedRelease(FWTPM_MASKED_CTX_PROTECT_KEY);
+#else
+    (void)ctx;
+#endif
+}
+
+/** \brief Overwrite a hierarchy seed with caller-staged bytes. */
+int FwSetHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy, const byte* value)
+{
+    byte* seed = FwAcquireHierarchySeed(ctx, hierarchy);
+    if (seed == NULL) {
+        return TPM_RC_FAILURE;
+    }
+    XMEMCPY(seed, value, FWTPM_SEED_SIZE);
+    FwReleaseHierarchySeed(ctx, hierarchy);
+    return 0;
+}
+
+/** \brief Draw a fresh hierarchy seed from the context RNG. */
+int FwRegenHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy)
+{
+    byte* seed = FwAcquireHierarchySeed(ctx, hierarchy);
+    int rc;
+    if (seed == NULL) {
+        return TPM_RC_FAILURE;
+    }
+    rc = wc_RNG_GenerateBlock(&ctx->rng, seed, FWTPM_SEED_SIZE);
+    FwReleaseHierarchySeed(ctx, hierarchy);
+    return rc;
 }
 
 /** \brief Derive proof value from hierarchy seeds via KDFa.
@@ -266,21 +356,31 @@ byte* FwGetHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy)
 int FwComputeProofValue(FWTPM_CTX* ctx, UINT32 hierarchy,
     TPMI_ALG_HASH hashAlg, byte* proofOut, int proofSize)
 {
-    byte* seed = FwGetHierarchySeed(ctx, hierarchy);
+    byte* seed = FwAcquireHierarchySeed(ctx, hierarchy);
     int rc;
     if (seed == NULL) {
         return TPM_RC_FAILURE;
     }
     if (hierarchy == TPM_RH_ENDORSEMENT &&
             ctx->endorsementProofVersion != 0) {
-        rc = TPM2_KDFa_ex(hashAlg, ctx->ownerSeed, FWTPM_SEED_SIZE,
-            "PROOF", ctx->endorsementSeed, FWTPM_SEED_SIZE,
-            NULL, 0, proofOut, proofSize);
+        /* seed is the EPS here; the SPS is a different handle, so holding
+         * both at once is within the one-acquire-per-handle rule. */
+        byte* ownerSeed = FwAcquireHierarchySeed(ctx, TPM_RH_OWNER);
+        if (ownerSeed == NULL) {
+            rc = TPM_RC_FAILURE;
+        }
+        else {
+            rc = TPM2_KDFa_ex(hashAlg, ownerSeed, FWTPM_SEED_SIZE,
+                "PROOF", seed, FWTPM_SEED_SIZE,
+                NULL, 0, proofOut, proofSize);
+            FwReleaseHierarchySeed(ctx, TPM_RH_OWNER);
+        }
     }
     else {
         rc = TPM2_KDFa_ex(hashAlg, seed, FWTPM_SEED_SIZE,
             "PROOF", NULL, 0, NULL, 0, proofOut, proofSize);
     }
+    FwReleaseHierarchySeed(ctx, hierarchy);
     if (rc != proofSize) {
         return TPM_RC_FAILURE;
     }
@@ -2599,10 +2699,16 @@ int FwWrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
     FWTPM_DECLARE_VAR(aes, Aes);
     FWTPM_DECLARE_VAR(hmac, Hmac);
     int aesInit = 0;
+    byte* protectKey;
     int totalSz = AES_BLOCK_SIZE + plainSz + WC_SHA256_DIGEST_SIZE;
 
     *outSz = 0;
     if (!ctx->ctxProtectKeyValid || totalSz > outBufSz) {
+        return TPM_RC_FAILURE;
+    }
+
+    protectKey = FwAcquireCtxProtectKey(ctx);
+    if (protectKey == NULL) {
         return TPM_RC_FAILURE;
     }
 
@@ -2619,7 +2725,7 @@ int FwWrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
         rc = wc_AesInit(aes, NULL, INVALID_DEVID);
         if (rc == 0) {
             aesInit = 1;
-            rc = wc_AesSetKey(aes, ctx->ctxProtectKey, AES_256_KEY_SIZE, iv, AES_ENCRYPTION);
+            rc = wc_AesSetKey(aes, protectKey, FWTPM_CTX_PROTECT_KEY_SIZE, iv, AES_ENCRYPTION);
         }
     }
     if (rc == 0) {
@@ -2636,7 +2742,7 @@ int FwWrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
     }
     if (rc == 0) {
         rc = wc_HmacSetKey(hmac, WC_SHA256,
-            ctx->ctxProtectKey, sizeof(ctx->ctxProtectKey));
+            protectKey, FWTPM_CTX_PROTECT_KEY_SIZE);
     }
     if (rc == 0) {
         rc = wc_HmacUpdate(hmac, out, AES_BLOCK_SIZE + plainSz);
@@ -2661,6 +2767,7 @@ int FwWrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
     }
 
     TPM2_ForceZero(iv, sizeof(iv));
+    FwReleaseCtxProtectKey(ctx);
     FWTPM_FREE_VAR(aes);
     FWTPM_FREE_VAR(hmac);
     return rc;
@@ -2676,6 +2783,7 @@ int FwUnwrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
     FWTPM_DECLARE_VAR(aes, Aes);
     FWTPM_DECLARE_VAR(hmac, Hmac);
     int aesInit = 0;
+    byte* protectKey;
     int cipherSz;
 
     *outSz = 0;
@@ -2690,6 +2798,11 @@ int FwUnwrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
         return TPM_RC_SIZE;
     }
 
+    protectKey = FwAcquireCtxProtectKey(ctx);
+    if (protectKey == NULL) {
+        return TPM_RC_FAILURE;
+    }
+
     FWTPM_ALLOC_VAR(aes, Aes);
     FWTPM_ALLOC_VAR(hmac, Hmac);
 
@@ -2699,7 +2812,7 @@ int FwUnwrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
     }
     if (rc == 0) {
         rc = wc_HmacSetKey(hmac, WC_SHA256,
-            ctx->ctxProtectKey, sizeof(ctx->ctxProtectKey));
+            protectKey, FWTPM_CTX_PROTECT_KEY_SIZE);
     }
     if (rc == 0) {
         rc = wc_HmacUpdate(hmac, in, AES_BLOCK_SIZE + cipherSz);
@@ -2730,7 +2843,7 @@ int FwUnwrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
         rc = wc_AesInit(aes, NULL, INVALID_DEVID);
         if (rc == 0) {
             aesInit = 1;
-            rc = wc_AesSetKey(aes, ctx->ctxProtectKey, AES_256_KEY_SIZE, in, AES_ENCRYPTION);
+            rc = wc_AesSetKey(aes, protectKey, FWTPM_CTX_PROTECT_KEY_SIZE, in, AES_ENCRYPTION);
         }
     }
     if (rc == 0) {
@@ -2749,6 +2862,7 @@ int FwUnwrapContextBlob(FWTPM_CTX* ctx, UINT64 seq, byte ctxType,
     }
 
     TPM2_ForceZero(computedHmac, sizeof(computedHmac));
+    FwReleaseCtxProtectKey(ctx);
     FWTPM_FREE_VAR(aes);
     FWTPM_FREE_VAR(hmac);
     return rc;

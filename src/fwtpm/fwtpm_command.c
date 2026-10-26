@@ -1204,10 +1204,18 @@ static TPM_RC FwCmd_Startup(FWTPM_CTX* ctx, TPM2_Packet* cmd, int cmdSize,
             /* Saved contexts are invalidated by Startup(CLEAR). */
             ctx->contextLiveCount = 0;
             ctx->ctxProtectKeyValid = 0;
-            TPM2_ForceZero(ctx->ctxProtectKey,
-                sizeof(ctx->ctxProtectKey));
-            rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->ctxProtectKey,
-                sizeof(ctx->ctxProtectKey));
+            {
+                byte* protectKey = FwAcquireCtxProtectKey(ctx);
+                if (protectKey == NULL) {
+                    rc = TPM_RC_FAILURE;
+                }
+                else {
+                    TPM2_ForceZero(protectKey, FWTPM_CTX_PROTECT_KEY_SIZE);
+                    rc = wc_RNG_GenerateBlock(&ctx->rng, protectKey,
+                        FWTPM_CTX_PROTECT_KEY_SIZE);
+                    FwReleaseCtxProtectKey(ctx);
+                }
+            }
             if (rc == 0) {
                 ctx->ctxProtectKeyValid = 1;
             }
@@ -1222,8 +1230,7 @@ static TPM_RC FwCmd_Startup(FWTPM_CTX* ctx, TPM2_Packet* cmd, int cmdSize,
 
             /* Regenerate the null seed on Startup(CLEAR). */
             if (rc == 0) {
-                rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->nullSeed,
-                    FWTPM_SEED_SIZE);
+                rc = FwRegenHierarchySeed(ctx, TPM_RH_NULL);
             }
             if (rc != 0) rc = TPM_RC_FAILURE;
 
@@ -4034,7 +4041,7 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     UINT32 creationPcrCount = 0;
     FWTPM_Object* obj = NULL;
     TPM_HANDLE objHandle = 0;
-    byte* seed;
+    byte* seed = NULL;
     int paramSzPos = 0, paramStart = 0;
     byte templateHash[WC_SHA256_DIGEST_SIZE];
     FWTPM_PrimaryCache* cached = NULL;
@@ -4055,7 +4062,9 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     /* Parse primary handle (hierarchy) */
     if (rc == 0) {
         TPM2_Packet_ParseU32(cmd, &primaryHandle);
-        seed = FwGetHierarchySeed(ctx, primaryHandle);
+        /* Held for the whole derivation below, and released at the single
+         * exit point. */
+        seed = FwAcquireHierarchySeed(ctx, primaryHandle);
         if (seed == NULL) {
             /* A permanent handle is a recognized hierarchy selector this
              * fwTPM does not support (includes the v1.85 firmware- and
@@ -4484,6 +4493,14 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
         rc = FwComputeObjectName(obj);
     }
 
+    /* Derivation is done. Release the seed now: the creation ticket below
+     * needs the hierarchy proof, which acquires this same seed again, and
+     * masked storage allows only one outstanding acquire per secret. */
+    if (seed != NULL) {
+        FwReleaseHierarchySeed(ctx, primaryHandle);
+        seed = NULL;
+    }
+
     /* --- Build response --- */
     if (rc == 0) {
         TPM2B_PUBLIC outPub;
@@ -4528,6 +4545,10 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     /* Cleanup on error */
     if (rc != 0 && obj != NULL) {
         FwFreeObject(obj);
+    }
+
+    if (seed != NULL) {
+        FwReleaseHierarchySeed(ctx, primaryHandle);
     }
 
     TPM2_ForceZero(&userAuth, sizeof(userAuth));
@@ -6097,6 +6118,12 @@ static TPM_RC FwCmd_Clear(FWTPM_CTX* ctx, TPM2_Packet* cmd, int cmdSize,
         }
         if (rc != 0) rc = TPM_RC_FAILURE;
 
+        /* Install the new SPS first: with masked storage this can fail, and
+         * nothing else may change unless it succeeded. */
+        if (rc == 0) {
+            rc = FwSetHierarchySeed(ctx, TPM_RH_OWNER, newOwnerSeed);
+        }
+
         /* Only commit state changes if seed generation succeeded. */
         if (rc == 0) {
             /* Defer object flush until after response auth is computed.
@@ -6106,7 +6133,6 @@ static TPM_RC FwCmd_Clear(FWTPM_CTX* ctx, TPM2_Packet* cmd, int cmdSize,
 
             XMEMSET(&ctx->ownerAuth, 0, sizeof(ctx->ownerAuth));
             XMEMSET(&ctx->endorsementAuth, 0, sizeof(ctx->endorsementAuth));
-            XMEMCPY(ctx->ownerSeed, newOwnerSeed, sizeof(ctx->ownerSeed));
             XMEMCPY(ctx->timeEpoch, newTimeEpoch, sizeof(ctx->timeEpoch));
             ctx->endorsementProofVersion = 1;
             /* Flush owner and endorsement primary cache entries after
@@ -6262,8 +6288,7 @@ static TPM_RC FwCmd_ChangeEPS(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     #endif
 
         /* Generate new endorsement seed */
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->endorsementSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_ENDORSEMENT);
         if (rc != 0) rc = TPM_RC_FAILURE;
 
         /* Only commit state changes if seed generation succeeded */
@@ -6329,8 +6354,7 @@ static TPM_RC FwCmd_ChangePPS(FWTPM_CTX* ctx, TPM2_Packet* cmd,
     #endif
 
         /* Generate new platform seed */
-        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->platformSeed,
-            FWTPM_SEED_SIZE);
+        rc = FwRegenHierarchySeed(ctx, TPM_RH_PLATFORM);
         if (rc != 0) rc = TPM_RC_FAILURE;
 
         /* Only commit state changes if seed generation succeeded */
@@ -10872,7 +10896,7 @@ static TPM_RC FwCmd_SequenceComplete(FWTPM_CTX* ctx, TPM2_Packet* cmd,
         TPM2_Packet_ParseU32(cmd, &hierarchy);
 
         digestSz = TPM2_GetHashDigestSize(seq->hashAlg);
-        if (FwGetHierarchySeed(ctx, hierarchy) == NULL) {
+        if (!FwHierarchyHasSeed(hierarchy)) {
             rc = TPM_RC_VALUE;
         }
     }
@@ -14479,7 +14503,7 @@ static TPM_RC FwCmd_PolicyTicket(FWTPM_CTX* ctx, TPM2_Packet* cmd,
         ticketTag != TPM_ST_AUTH_SECRET) {
         rc = TPM_RC_TICKET;
     }
-    if (rc == 0 && FwGetHierarchySeed(ctx, ticketHier) == NULL) {
+    if (rc == 0 && !FwHierarchyHasSeed(ticketHier)) {
         rc = TPM_RC_VALUE;
     }
 

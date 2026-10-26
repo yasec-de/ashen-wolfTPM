@@ -73,7 +73,23 @@ TPM_RC FwDeriveSymmetricPrimaryKey(TPMI_ALG_HASH nameAlg,
 
 int FwComputeObjectName(FWTPM_Object* obj);
 
-byte* FwGetHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy);
+/* Pin a hierarchy seed and return a writable pointer to it, or NULL for an
+ * unknown hierarchy. Every successful acquire must be matched by a release as
+ * soon as the seed is no longer needed. */
+byte* FwAcquireHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy);
+/* Whether a hierarchy handle has a seed, without acquiring it. */
+int   FwHierarchyHasSeed(UINT32 hierarchy);
+void  FwReleaseHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy);
+
+/* Same, for the per-boot context protection key. */
+byte* FwAcquireCtxProtectKey(FWTPM_CTX* ctx);
+void  FwReleaseCtxProtectKey(FWTPM_CTX* ctx);
+
+/* Overwrite a hierarchy seed with FWTPM_SEED_SIZE caller-staged bytes. */
+int FwSetHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy, const byte* value);
+
+/* Draw a fresh hierarchy seed from the context RNG. */
+int FwRegenHierarchySeed(FWTPM_CTX* ctx, UINT32 hierarchy);
 
 int FwComputeProofValue(FWTPM_CTX* ctx, UINT32 hierarchy,
     TPMI_ALG_HASH hashAlg, byte* proofOut, int proofSize);
