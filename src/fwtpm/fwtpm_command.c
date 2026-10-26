@@ -20186,7 +20186,7 @@ static const FWTPM_CMD_ENTRY fwCmdTable[] = {
 #endif /* !FWTPM_NO_ECDH */
 #endif
     /* --- Sessions --- */
-    { TPM_CC_StartAuthSession,   FwCmd_StartAuthSession,     2, 0, 1, 0 },
+    { TPM_CC_StartAuthSession,   FwCmd_StartAuthSession,     2, 0, 1, FW_CMD_FLAG_ENC | FW_CMD_FLAG_DEC },
     { TPM_CC_Unseal,             FwCmd_Unseal,               1, 1, 0, FW_CMD_FLAG_DEC },
     /* --- Policy --- */
 #ifndef FWTPM_NO_POLICY
@@ -21867,6 +21867,28 @@ int FWTPM_ProcessCommand(FWTPM_CTX* ctx,
         *rspSize = FwBuildErrorResponse(rspBuf, rspCap, TPM_ST_NO_SESSIONS,
             TPM_RC_SIZE);
         rspTruncated = 1;
+    }
+    /* Handlers for commands without authorization handles finalize with
+     * TPM_ST_NO_SESSIONS, i.e. handles followed directly by the parameters.
+     * When the caller attached sessions (encryption or audit), the response
+     * must still carry parameterSize and one response auth per session
+     * (Part 1 Sec.18.8), or the caller cannot parse it. Convert the layout
+     * and let the session path below finish the response. */
+    if (rc == TPM_RC_SUCCESS && !rspTruncated && cmdTag == TPM_ST_SESSIONS &&
+            cmdAuthCnt > 0 && rspPkt.pos >= TPM2_HEADER_SIZE &&
+            FwLoadU16BE(rspBuf) == TPM_ST_NO_SESSIONS) {
+        int hEnd = TPM2_HEADER_SIZE + (entry->outHandleCnt * 4);
+        if (hEnd > rspPkt.pos || rspPkt.pos + 4 > rspCap) {
+            *rspSize = FwBuildErrorResponse(rspBuf, rspCap,
+                TPM_ST_NO_SESSIONS, TPM_RC_SIZE);
+            rspTruncated = 1;
+        }
+        else {
+            XMEMMOVE(rspBuf + hEnd + 4, rspBuf + hEnd, rspPkt.pos - hEnd);
+            FwStoreU32BE(rspBuf + hEnd, (UINT32)(rspPkt.pos - hEnd));
+            rspPkt.pos += 4;
+            FwStoreU16BE(rspBuf, TPM_ST_SESSIONS);
+        }
     }
     if (rspTruncated) {
         /* response already built above */
