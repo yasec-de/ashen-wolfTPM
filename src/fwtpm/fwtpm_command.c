@@ -4531,7 +4531,7 @@ static TPM_RC FwCmd_CreatePrimary(FWTPM_CTX* ctx, TPM2_Packet* cmd,
         TPM2_Packet_AppendU16(rsp, 0); /* outsideInfo */
         TPM2_Packet_PlaceU16(rsp, cdMarkPos);
 
-        FwAppendCreationHashAndTicket(ctx, rsp, primaryHandle,
+        rc = FwAppendCreationHashAndTicket(ctx, rsp, primaryHandle,
             obj->pub.nameAlg, cdStart, rsp->pos - cdStart,
             (byte*)obj->name.name, obj->name.size);
 
@@ -7333,7 +7333,7 @@ static TPM_RC FwCmd_Create(FWTPM_CTX* ctx, TPM2_Packet* cmd,
 
         /* Creation ticket hierarchy = parent's hierarchy per Part 2
          * Sec.10.6.5 Table 112. */
-        FwAppendCreationHashAndTicket(ctx, rsp, parent->hierarchy,
+        rc = FwAppendCreationHashAndTicket(ctx, rsp, parent->hierarchy,
             inPublic->publicArea.nameAlg, cdStart2, rsp->pos - cdStart2,
             objName, objNameSz);
 
